@@ -11,6 +11,43 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+const admin = require("firebase-admin");
+const serviceAccount = require("./firebase_admin_key.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const verifyFBToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) {
+    return res.status(401).send({ error: "Unauthorized access" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.decoded = decoded;
+    next();
+  } catch (err) {
+    return res.status(403).send({ error: "Forbidden: Invalid token" });
+  }
+};
+
+
+
+const verifyAdmin = async(req, res, next)=>{
+  const email = req.decoded.email;
+  const query = {email};
+  const user = await usersCollection.findOne(query);
+  if(!user || user.role !== 'admin'){
+    return res.status(403).send({message: 'unauthorized access'});
+  }
+  next();
+}
+
+
 // MongoDB URI
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.ljb3mts.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 const client = new MongoClient(uri, {
@@ -66,7 +103,7 @@ app.post("/users", async (req, res) => {
 // RIDE APPLICATION: Apply to be a rider
 app.post("/riders", async (req, res) => {
   try {
-    const rider = { ...req.body, status: "pending" };  // Set default status to pending
+    const rider = { ...req.body, status: "pending" };
 
     if (!rider.email) {
       return res.status(400).send({ message: "Email is required" });
@@ -93,7 +130,7 @@ app.post("/riders", async (req, res) => {
 });
 
 // Get pending riders
-app.get("/riders/pending", async (req, res) => {
+app.get("/riders/pending",verifyFBToken, verifyAdmin, async (req, res) => {
   try {
     const pendingRiders = await ridersCollection.find({ status: "pending" }).toArray();
     res.send(pendingRiders);
@@ -103,24 +140,44 @@ app.get("/riders/pending", async (req, res) => {
 });
 
 //get approved riders
-app.get("/riders/approved", async (req, res) => {
+app.get("/riders/approved", verifyFBToken, verifyAdmin, async (req, res) => {
   const approved = await ridersCollection.find({ status: "approved" }).toArray();
   res.send(approved);
 });
 
 
-// Approve rider
+// Approve rider and update user role
 app.patch("/riders/approve/:id", async (req, res) => {
   try {
-    const result = await ridersCollection.updateOne(
-      { _id: new ObjectId(req.params.id) },
-      { $set: { status: "approved" } }
+    const id = req.params.id;
+
+    // 1. Get rider info
+    const rider = await ridersCollection.findOne({ _id: new ObjectId(id) });
+    if (!rider) return res.status(404).send({ error: "Rider not found" });
+
+    // 2. Approve rider in ridersCollection
+    const riderUpdate = await ridersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: "approved", updatedAt: new Date() } }
     );
-    res.send(result);
+
+    // 3. Update user role in usersCollection
+    const userUpdate = await usersCollection.updateOne(
+      { email: rider.email },
+      { $set: { role: "rider" } }
+    );
+
+    res.send({
+      riderUpdated: riderUpdate.modifiedCount,
+      userRoleUpdated: userUpdate.modifiedCount,
+      message: "Rider approved and user role updated",
+    });
   } catch (err) {
     res.status(500).send({ error: err.message });
   }
 });
+
+
 
 app.patch("/riders/pending/:id", async (req, res) => {
   const id = req.params.id;
@@ -137,6 +194,83 @@ app.patch("/riders/pending/:id", async (req, res) => {
 });
 
 
+app.get("/users/search", async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email) {
+      return res.status(400).send({ message: "Email query is required" });
+    }
+
+    const regex = new RegExp(email, "i");
+    const matchedUsers = await usersCollection.find({ email: { $regex: regex } }).toArray();
+
+    res.send(matchedUsers);
+  } catch (err) {
+    res.status(500).send({ error: err.message });
+  }
+});
+
+// PATCH: Update user role (make/remove admin)
+app.patch("/users/:id", async (req, res) => {
+  const userId = req.params.id;
+  const { role } = req.body; // 'admin' or 'user'
+  const result = await usersCollection.updateOne(
+    { _id: new ObjectId(userId) },
+    { $set: { role } }
+  );
+  res.send(result);
+});
+
+app.get("/users/role", async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email) return res.status(400).send({ message: "Email is required" });
+
+    const user = await usersCollection.findOne({ email }, { projection: { role: 1 } });
+
+    if (!user) return res.status(404).send({ message: "User not found" });
+
+    res.send({ role: user.role || "user" });
+  } catch (err) {
+    res.status(500).send({ error: err.message });
+  }
+});
+
+
+
+
+app.patch("/riders/approve/:id", verifyFBToken, verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    // 1. Get rider info
+    const rider = await ridersCollection.findOne({ _id: new ObjectId(id) });
+    if (!rider) return res.status(404).send({ error: "Rider not found" });
+
+    // 2. Approve rider in ridersCollection
+    const riderUpdate = await ridersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: "approved", updatedAt: new Date() } }
+    );
+
+    // 3. Update user role in usersCollection
+    const userUpdate = await usersCollection.updateOne(
+      { email: rider.email },
+      { $set: { role: "rider" } }
+    );
+
+    res.send({
+      riderUpdated: riderUpdate.modifiedCount,
+      userRoleUpdated: userUpdate.modifiedCount,
+      message: "Rider approved and user role updated",
+    });
+  } catch (err) {
+    res.status(500).send({ error: err.message });
+  }
+});
+
+
+
 // Delete rider
 app.delete("/riders/:id", async (req, res) => {
   try {
@@ -148,7 +282,7 @@ app.delete("/riders/:id", async (req, res) => {
 });
 
 // PARCEL ROUTES
-app.get("/parcels", async (req, res) => {
+app.get("/parcels", verifyFBToken, async (req, res) => {
   try {
     const query = req.query.email ? { created_email: req.query.email } : {};
     const parcels = await parcelsCollection.find(query).sort({ createdAt: -1 }).toArray();
@@ -218,7 +352,7 @@ app.post("/payments", async (req, res) => {
   }
 });
 
-app.get("/payments", async (req, res) => {
+app.get("/payments", verifyFBToken, async (req, res) => {
   try {
     const query = req.query.email ? { email: req.query.email } : {};
     const payments = await paymentCollection.find(query).sort({ createdAt: -1 }).toArray();
